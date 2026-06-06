@@ -80,8 +80,11 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
         'ffmpeg',
         [
           '-loglevel', 'error',
+          '-threads', '1',
           '-i',
           inputPath,
+          '-vf',
+          "scale='min(1280,iw)':'-2'",
           '-codec:v',
           'libx264',
           '-preset',
