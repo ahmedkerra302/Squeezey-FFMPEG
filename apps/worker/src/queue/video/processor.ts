@@ -124,7 +124,8 @@ async function shouldCopyStreams(inputPath: string): Promise<boolean> {
 }
 
 export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<JobResult> {
-  const { inputPath, outputPath, crf, preset, smartCopy } = job.data;
+  const { inputPath, outputPath, crf, preset, smartCopy, maxEdge } = job.data;
+  const edge = maxEdge && maxEdge > 0 ? maxEdge : 1280;
 
   if (!existsSync(inputPath)) {
     return {
@@ -159,7 +160,7 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
           '-dn',
           '-sn',
           '-ignore_unknown',
-          '-vf', "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))'",
+          '-vf', `scale='if(gte(iw,ih),min(${edge},iw),-2)':'if(gte(iw,ih),-2,min(${edge},ih))'`,
           '-pix_fmt', 'yuv420p',
           '-codec:v', 'libx264',
           // Restore the previous real-compression profile now that the
