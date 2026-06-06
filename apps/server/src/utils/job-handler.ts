@@ -1,11 +1,19 @@
 import { z } from 'zod';
 import { randomUUID } from 'crypto';
-import { mkdir, writeFile, readFile, rm } from 'fs/promises';
+import { createWriteStream, createReadStream } from 'fs';
+import { mkdir, readFile, rm, stat } from 'fs/promises';
+import { pipeline } from 'stream/promises';
+import { Readable } from 'stream';
 import path from 'path';
 import { env } from '~/config/env';
 import { logger } from '~/config/logger';
 import { addJob, queueEvents, validateJobResult, JobTypeName } from '~/queue';
 import { computeCacheKey, getCachedOutput, putCachedOutput, isCacheEligibleJobData } from '~/utils/cache';
+
+// Only buffer/cache outputs up to this size. Larger outputs are streamed
+// straight from disk to avoid OOM-killing the server process under
+// Railway's default memory limit.
+const MAX_INMEMORY_BYTES = 16 * 1024 * 1024; // 16 MB
 
 const JobPathsSchema = z.object({
   inputPath: z.string(),
@@ -33,6 +41,9 @@ type ProcessJobResult =
       outputPath?: string;
       outputUrl?: string;
       outputBuffer?: Buffer;
+      outputStream?: NodeJS.ReadableStream;
+      outputSize?: number;
+      cleanup?: () => Promise<void>;
       metadata?: Record<string, unknown>;
     }
   | {
@@ -60,38 +71,53 @@ export async function processMediaJob(options: ProcessJobOptions): Promise<Proce
     await rm(jobDir, { recursive: true, force: true });
   };
 
+  let success = false;
+
   try {
     const paths: JobPaths = { inputPath, outputPath, jobDir };
     const payload = jobData(paths);
 
-    const inputBuffer = Buffer.from(await file.arrayBuffer());
-    const canUseCache = env.CACHE_ENABLED && isCacheEligibleJobData(payload);
+    await mkdir(jobDir, { recursive: true });
+
+    // Stream the upload straight to disk. The previous implementation
+    // called `await file.arrayBuffer()` which loaded the entire upload
+    // (potentially 100+ MB) into RSS and SIGKILL'd the server process
+    // on Railway's default 512 MB limit.
+    const inputStream = file.stream() as unknown as ReadableStream<Uint8Array>;
+    await pipeline(
+      Readable.fromWeb(inputStream as never),
+      createWriteStream(inputPath)
+    );
+
+    const inputStat = await stat(inputPath);
+    const inputSize = inputStat.size;
+
+    // Caching requires the whole input in memory to hash. Only attempt
+    // it for small inputs; for everything else we just skip the cache.
+    const canUseCache =
+      env.CACHE_ENABLED &&
+      isCacheEligibleJobData(payload) &&
+      inputSize <= MAX_INMEMORY_BYTES;
     let cacheKey: string | null = null;
     if (canUseCache) {
+      const inputBuffer = await readFile(inputPath);
       cacheKey = computeCacheKey(inputBuffer, jobType, outputExtension, payload);
-    }
-
-    if (cacheKey) {
       const cached = await getCachedOutput(cacheKey);
       if (cached) {
         logger.info(
-          {
-            jobType,
-            outputExtension,
-            cacheKey
-          },
+          { jobType, outputExtension, cacheKey },
           'Stateless binary cache hit'
         );
+        success = true;
         return {
           success: true,
           outputBuffer: cached.outputBuffer,
-          metadata: cached.metadata
+          outputSize: cached.outputBuffer.length,
+          metadata: cached.metadata,
+          cleanup
         };
       }
     }
-
-    await mkdir(jobDir, { recursive: true });
-    await writeFile(inputPath, inputBuffer);
 
     const job = await addJob(jobType, payload);
     const rawResult = await job.waitUntilFinished(queueEvents);
@@ -102,17 +128,43 @@ export async function processMediaJob(options: ProcessJobOptions): Promise<Proce
     }
 
     if (result.outputUrl) {
-      return { success: true, outputUrl: result.outputUrl, metadata: result.metadata };
+      success = true;
+      return {
+        success: true,
+        outputUrl: result.outputUrl,
+        metadata: result.metadata,
+        cleanup
+      };
     }
 
     if (result.outputPath) {
-      const outputBuffer = await readFile(result.outputPath);
+      const outputStat = await stat(result.outputPath);
+      const outputSize = outputStat.size;
 
-      if (cacheKey) {
+      // Small output -> buffer (so we can cache); large -> stream.
+      if (cacheKey && outputSize <= MAX_INMEMORY_BYTES) {
+        const outputBuffer = await readFile(result.outputPath);
         await putCachedOutput(cacheKey, outputBuffer, result.metadata);
+        success = true;
+        return {
+          success: true,
+          outputPath: result.outputPath,
+          outputBuffer,
+          outputSize,
+          metadata: result.metadata,
+          cleanup
+        };
       }
 
-      return { success: true, outputPath: result.outputPath, outputBuffer, metadata: result.metadata };
+      success = true;
+      return {
+        success: true,
+        outputPath: result.outputPath,
+        outputStream: createReadStream(result.outputPath),
+        outputSize,
+        metadata: result.metadata,
+        cleanup
+      };
     }
 
     return { success: false, error: 'No output produced' };
@@ -123,13 +175,14 @@ export async function processMediaJob(options: ProcessJobOptions): Promise<Proce
     } else {
       errorMessage = String(error);
     }
-
-    return {
-      success: false,
-      error: errorMessage
-    };
+    return { success: false, error: errorMessage };
   } finally {
-    await cleanup();
+    // Only auto-clean on failure. On success, the caller is responsible
+    // for invoking result.cleanup() AFTER it has finished streaming the
+    // output file back to the client.
+    if (!success) {
+      await cleanup();
+    }
   }
 }
 
@@ -138,6 +191,5 @@ export function getOutputFilename(originalName: string, newExtension: string): s
   if (newExtension) {
     return `${baseName}.${newExtension}`;
   }
-
   return baseName;
 }
