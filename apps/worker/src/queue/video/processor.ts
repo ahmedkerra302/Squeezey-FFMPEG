@@ -150,12 +150,23 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
           '-loglevel', 'warning',
           '-threads', '1',
           '-i', inputPath,
+          // Explicitly map only the first video + (optional) first audio
+          // stream. This skips attached pictures / cover art (which trigger
+          // "Unknown cover type" errors on iPhone & CapCut MP4s), subtitle
+          // streams, and arbitrary data streams that can blow up memory.
+          '-map', '0:v:0',
+          '-map', '0:a:0?',
+          '-dn',
+          '-sn',
+          '-ignore_unknown',
           '-vf', "scale='min(1280,iw)':'-2'",
+          '-pix_fmt', 'yuv420p',
           '-codec:v', 'libx264',
           '-preset', preset,
           '-crf', crf.toString(),
           '-codec:a', 'aac',
           '-b:a', '128k',
+          '-max_muxing_queue_size', '1024',
           '-movflags', '+faststart',
           '-y', outputPath
         ],
