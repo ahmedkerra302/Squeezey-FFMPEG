@@ -79,6 +79,7 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
       await execFileAsync(
         'ffmpeg',
         [
+          '-loglevel', 'error',
           '-i',
           inputPath,
           '-codec:v',
@@ -96,7 +97,7 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
           '-y',
           outputPath
         ],
-        { timeout: PROCESSING_TIMEOUT }
+        { timeout: PROCESSING_TIMEOUT, maxBuffer: 1024 * 1024 * 100 }
       );
     }
 
@@ -144,7 +145,7 @@ export async function processVideoExtractAudio(job: Job<VideoExtractAudioJobData
 
     args.push('-y', outputPath);
 
-    await execFileAsync('ffmpeg', args, { timeout: PROCESSING_TIMEOUT });
+    await execFileAsync('ffmpeg', args, { timeout: PROCESSING_TIMEOUT, maxBuffer: 1024 * 1024 * 100 });
 
     if (job.data.uploadToS3) {
       const { url } = await uploadToS3(outputPath, 'audio/wav', basename(outputPath));
@@ -192,7 +193,7 @@ export async function processVideoExtractFrames(job: Job<VideoExtractFramesJobDa
 
     args.push('-y', outputPattern);
 
-    await execFileAsync('ffmpeg', args, { timeout: PROCESSING_TIMEOUT });
+    await execFileAsync('ffmpeg', args, { timeout: PROCESSING_TIMEOUT, maxBuffer: 1024 * 1024 * 100 });
 
     const { readdirSync } = await import('fs');
     const frames = readdirSync(outputDir)
