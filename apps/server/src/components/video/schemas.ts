@@ -11,6 +11,34 @@ import {
 } from '~/utils/schemas';
 
 /**
+ * Phase 2 compression options (query params)
+ */
+export const VideoCompressionQuerySchema = z.object({
+  crf: z
+    .string()
+    .regex(/^\d+$/)
+    .transform(Number)
+    .pipe(z.number().int().min(0).max(51))
+    .optional()
+    .openapi({
+      param: { name: 'crf', in: 'query' },
+      example: '28',
+      description: 'H.264 CRF (0=lossless, 51=worst). Lower = higher quality, larger file.'
+    }),
+  maxEdge: z
+    .string()
+    .regex(/^\d+$/)
+    .transform(Number)
+    .pipe(z.number().int().min(120).max(4096))
+    .optional()
+    .openapi({
+      param: { name: 'maxEdge', in: 'query' },
+      example: '1280',
+      description: 'Maximum long-edge resolution in pixels.'
+    })
+});
+
+/**
  * POST /video/mp4 - Convert any video format to MP4
  */
 export const videoToMp4Route = createRoute({
@@ -18,6 +46,7 @@ export const videoToMp4Route = createRoute({
   path: '/video/mp4',
   tags: ['Video'],
   request: {
+    query: VideoCompressionQuerySchema,
     body: {
       content: {
         'multipart/form-data': {
