@@ -1,4 +1,6 @@
+import type { Context } from 'hono';
 import type { OpenAPIHono } from '@hono/zod-openapi';
+import { Readable } from 'stream';
 import {
   videoToMp4Route,
   videoToMp4UrlRoute,
@@ -12,6 +14,62 @@ import { videoToGifRoute, videoToGifUrlRoute } from './gif-schemas';
 import { JobType } from '~/queue';
 import { env } from '~/config/env';
 import { processMediaJob, getOutputFilename } from '~/utils/job-handler';
+
+type BinaryResult = {
+  outputBuffer?: Buffer;
+  outputStream?: NodeJS.ReadableStream;
+  outputSize?: number;
+  cleanup?: () => Promise<void>;
+};
+
+// Send either a buffered or streamed result, and run cleanup() AFTER
+// the response body has been fully sent. We rely on the platform fetch
+// runtime to drain the ReadableStream before continuing.
+function sendBinary(
+  c: Context,
+  result: BinaryResult,
+  contentType: string,
+  filename: string,
+  fallbackError: string
+) {
+  const headers: Record<string, string> = {
+    'Content-Type': contentType,
+    'Content-Disposition': `attachment; filename="${filename}"`
+  };
+  if (result.outputSize) {
+    headers['Content-Length'] = String(result.outputSize);
+  }
+
+  if (result.outputBuffer) {
+    const response = c.body(new Uint8Array(result.outputBuffer), 200, headers);
+    // Buffered path: safe to cleanup immediately, the bytes are in memory.
+    result.cleanup?.().catch(() => {});
+    return response;
+  }
+
+  if (result.outputStream) {
+    const nodeStream = result.outputStream;
+    // Convert Node Readable -> Web ReadableStream so Hono/the runtime can
+    // stream it directly to the client without buffering it again.
+    const webStream = Readable.toWeb(nodeStream as Readable) as unknown as ReadableStream<Uint8Array>;
+
+    // Defer cleanup until the stream ends or errors.
+    nodeStream.once('end', () => {
+      result.cleanup?.().catch(() => {});
+    });
+    nodeStream.once('error', () => {
+      result.cleanup?.().catch(() => {});
+    });
+    nodeStream.once('close', () => {
+      result.cleanup?.().catch(() => {});
+    });
+
+    return c.body(webStream, 200, headers);
+  }
+
+  result.cleanup?.().catch(() => {});
+  return c.json({ error: fallbackError }, 400);
+}
 
 export function registerVideoRoutes(app: OpenAPIHono) {
   app.openapi(videoToMp4Route, async (c) => {
@@ -35,14 +93,13 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         return c.json({ error: result.error }, 400);
       }
 
-      if (!result.outputBuffer) {
-        return c.json({ error: 'Conversion failed' }, 400);
-      }
-
-      return c.body(new Uint8Array(result.outputBuffer), 200, {
-        'Content-Type': 'video/mp4',
-        'Content-Disposition': `attachment; filename="${getOutputFilename(file.name, 'mp4')}"`
-      });
+      return sendBinary(
+        c,
+        result,
+        'video/mp4',
+        getOutputFilename(file.name, 'mp4'),
+        'Conversion failed'
+      );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return c.json({ error: 'Processing failed', message: errorMessage }, 500);
@@ -70,14 +127,13 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         return c.json({ error: result.error }, 400);
       }
 
-      if (!result.outputBuffer) {
-        return c.json({ error: 'Audio extraction failed' }, 400);
-      }
-
-      return c.body(new Uint8Array(result.outputBuffer), 200, {
-        'Content-Type': 'audio/wav',
-        'Content-Disposition': `attachment; filename="${getOutputFilename(file.name, 'wav')}"`
-      });
+      return sendBinary(
+        c,
+        result,
+        'audio/wav',
+        getOutputFilename(file.name, 'wav'),
+        'Audio extraction failed'
+      );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return c.json({ error: 'Processing failed', message: errorMessage }, 500);
@@ -120,15 +176,14 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         return c.json({ error: result.error }, 400);
       }
 
-      if (!result.outputBuffer) {
-        return c.json({ error: 'Frame extraction failed' }, 400);
-      }
-
       const contentType = compress === 'zip' ? 'application/zip' : 'application/gzip';
-      return c.body(new Uint8Array(result.outputBuffer), 200, {
-        'Content-Type': contentType,
-        'Content-Disposition': `attachment; filename="${getOutputFilename(file.name, '')}_frames.${extension}"`
-      });
+      return sendBinary(
+        c,
+        result,
+        contentType,
+        `${getOutputFilename(file.name, '')}_frames.${extension}`,
+        'Frame extraction failed'
+      );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return c.json({ error: 'Processing failed', message: errorMessage }, 500);
@@ -160,6 +215,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
       if (!result.success) {
         return c.json({ error: result.error }, 400);
       }
+
+      result.cleanup?.().catch(() => {});
 
       if (!result.outputUrl) {
         return c.json({ error: 'Conversion failed' }, 400);
@@ -197,6 +254,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
       if (!result.success) {
         return c.json({ error: result.error }, 400);
       }
+
+      result.cleanup?.().catch(() => {});
 
       if (!result.outputUrl) {
         return c.json({ error: 'Audio extraction failed' }, 400);
@@ -250,6 +309,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         return c.json({ error: result.error }, 400);
       }
 
+      result.cleanup?.().catch(() => {});
+
       if (!result.outputUrl) {
         return c.json({ error: 'Frame extraction failed' }, 400);
       }
@@ -291,14 +352,13 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         return c.json({ error: result.error }, 400);
       }
 
-      if (!result.outputBuffer) {
-        return c.json({ error: 'Conversion failed' }, 400);
-      }
-
-      return c.body(new Uint8Array(result.outputBuffer), 200, {
-        'Content-Type': 'image/gif',
-        'Content-Disposition': `attachment; filename="${getOutputFilename(file.name, 'gif')}"`
-      });
+      return sendBinary(
+        c,
+        result,
+        'image/gif',
+        getOutputFilename(file.name, 'gif'),
+        'Conversion failed'
+      );
     } catch (error) {
       const errorMessage = error instanceof Error ? error.message : String(error);
       return c.json({ error: 'Processing failed', message: errorMessage }, 500);
@@ -330,6 +390,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
       if (!result.success) {
         return c.json({ error: result.error }, 400);
       }
+
+      result.cleanup?.().catch(() => {});
 
       if (!result.outputUrl) {
         return c.json({ error: 'Conversion failed' }, 400);
