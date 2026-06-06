@@ -75,6 +75,12 @@ export function registerVideoRoutes(app: OpenAPIHono) {
   app.openapi(videoToMp4Route, async (c) => {
     try {
       const { file } = c.req.valid('form');
+      // Phase 2: allow callers to override compression strength + max edge.
+      // When the query is absent, defaults match the previous deploy
+      // (CRF 28, veryfast preset, 1280px long edge).
+      const query = c.req.valid('query') as { crf?: number; maxEdge?: number };
+      const crf = query.crf ?? 28;
+      const maxEdge = query.maxEdge ?? 1280;
 
       const result = await processMediaJob({
         file,
@@ -83,9 +89,10 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         jobData: ({ inputPath, outputPath }) => ({
           inputPath,
           outputPath,
-          crf: 28,
+          crf,
           preset: 'veryfast',
-          smartCopy: false
+          smartCopy: false,
+          maxEdge
         })
       });
 
