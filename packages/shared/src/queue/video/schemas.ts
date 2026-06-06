@@ -8,7 +8,11 @@ export const VideoToMp4JobDataSchema = z.object({
     .enum(['ultrafast', 'superfast', 'veryfast', 'faster', 'fast', 'medium', 'slow', 'slower', 'veryslow'])
     .default('medium'),
   smartCopy: z.boolean().default(true),
-  uploadToS3: z.boolean().default(false)
+  uploadToS3: z.boolean().default(false),
+  // Phase 2: max long-edge in pixels for the scale filter. When omitted,
+  // the processor falls back to the previous default (1280). Values <= 0
+  // disable scaling entirely.
+  maxEdge: z.number().int().positive().optional()
 });
 
 export const VideoExtractAudioJobDataSchema = z.object({
