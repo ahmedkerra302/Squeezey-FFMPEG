@@ -159,20 +159,16 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
           '-dn',
           '-sn',
           '-ignore_unknown',
-          '-vf', "scale='if(gte(iw,ih),min(1920,iw),-2)':'if(gte(iw,ih),-2,min(1920,ih))'",
+          '-vf', "scale='if(gte(iw,ih),min(1280,iw),-2)':'if(gte(iw,ih),-2,min(1280,ih))'",
           '-pix_fmt', 'yuv420p',
           '-codec:v', 'libx264',
-          // Keep the encode reliable on Railway's 512MB worker while
-          // making compression less aggressive: preserve up to 1080p/1920px
-          // long edge, use a higher-quality CRF cap, and keep x264's
-          // low-memory buffers disabled.
-          '-preset', 'ultrafast',
-          '-tune', 'fastdecode,zerolatency',
-          '-x264-params', 'ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0',
-          '-crf', Math.min(crf, 23).toString(),
+          // Restore the previous real-compression profile now that the
+          // Railway service has more headroom: CRF 28 + veryfast + 1280px
+          // long edge was the profile that made small 3–4 MB files smaller.
+          '-preset', preset,
+          '-crf', crf.toString(),
           '-codec:a', 'aac',
           '-b:a', '128k',
-          '-ac', '2',
           '-max_muxing_queue_size', '1024',
           '-movflags', '+faststart',
           '-y', outputPath
