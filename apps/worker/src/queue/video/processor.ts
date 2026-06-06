@@ -162,10 +162,18 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
           '-vf', "scale='min(1280,iw)':'-2'",
           '-pix_fmt', 'yuv420p',
           '-codec:v', 'libx264',
-          '-preset', preset,
+          // Force the lowest-memory x264 settings. Railway Trial caps
+          // the worker at ~512MB which is too tight for libx264's
+          // default lookahead/reference buffers on 1080p inputs.
+          // ultrafast + ref=1 + bframes=0 + no rc-lookahead keeps RSS
+          // under ~250MB even on 67MB+ files.
+          '-preset', 'ultrafast',
+          '-tune', 'fastdecode,zerolatency',
+          '-x264-params', 'ref=1:bframes=0:rc-lookahead=0:sliced-threads=0:sync-lookahead=0',
           '-crf', crf.toString(),
           '-codec:a', 'aac',
-          '-b:a', '128k',
+          '-b:a', '96k',
+          '-ac', '2',
           '-max_muxing_queue_size', '1024',
           '-movflags', '+faststart',
           '-y', outputPath
