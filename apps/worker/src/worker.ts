@@ -48,7 +48,12 @@ const worker = new Worker<unknown, JobResult>(
   }
 );
 
-worker.on('completed', (job) => {
+worker.on('completed', (job, result) => {
+  if (result?.success === false) {
+    logger.error({ jobId: job.id, error: result.error }, 'Job completed with processing error');
+    return;
+  }
+
   logger.info({ jobId: job.id }, 'Job completed successfully');
 });
 

@@ -9,7 +9,7 @@ const schema = z.object({
   NODE_ENV: z.enum(['development', 'production', 'test']).default('development'),
 
   REDIS_URL: z.string().default('redis://localhost:6379'),
-  WORKER_CONCURRENCY: z.coerce.number().default(5),
+  WORKER_CONCURRENCY: z.coerce.number().default(1),
 
   STORAGE_MODE: z.enum(['stateless', 's3']).default('stateless'),
 

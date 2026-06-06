@@ -159,20 +159,19 @@ export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<Jo
           '-dn',
           '-sn',
           '-ignore_unknown',
-          '-vf', "scale='min(1280,iw)':'-2'",
+          '-vf', "scale='if(gte(iw,ih),min(1920,iw),-2)':'if(gte(iw,ih),-2,min(1920,ih))'",
           '-pix_fmt', 'yuv420p',
           '-codec:v', 'libx264',
-          // Force the lowest-memory x264 settings. Railway Trial caps
-          // the worker at ~512MB which is too tight for libx264's
-          // default lookahead/reference buffers on 1080p inputs.
-          // ultrafast + ref=1 + bframes=0 + no rc-lookahead keeps RSS
-          // under ~250MB even on 67MB+ files.
+          // Keep the encode reliable on Railway's 512MB worker while
+          // making compression less aggressive: preserve up to 1080p/1920px
+          // long edge, use a higher-quality CRF cap, and keep x264's
+          // low-memory buffers disabled.
           '-preset', 'ultrafast',
           '-tune', 'fastdecode,zerolatency',
-          '-x264-params', 'ref=1:bframes=0:rc-lookahead=0:sliced-threads=0:sync-lookahead=0',
-          '-crf', crf.toString(),
+          '-x264-params', 'ref=1:bframes=0:rc-lookahead=0:sync-lookahead=0',
+          '-crf', Math.min(crf, 23).toString(),
           '-codec:a', 'aac',
-          '-b:a', '96k',
+          '-b:a', '128k',
           '-ac', '2',
           '-max_muxing_queue_size', '1024',
           '-movflags', '+faststart',

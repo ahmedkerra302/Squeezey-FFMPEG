@@ -83,8 +83,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         jobData: ({ inputPath, outputPath }) => ({
           inputPath,
           outputPath,
-          crf: 28,
-          preset: 'veryfast',
+          crf: 23,
+          preset: 'ultrafast',
           smartCopy: false
         })
       });
@@ -205,8 +205,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         jobData: ({ inputPath, outputPath }) => ({
           inputPath,
           outputPath,
-          crf: 28,
-          preset: 'veryfast',
+          crf: 23,
+          preset: 'ultrafast',
           smartCopy: false,
           uploadToS3: true
         })
