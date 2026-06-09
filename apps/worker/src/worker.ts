@@ -11,6 +11,7 @@ import { processVideoToMp4, processVideoExtractAudio, processVideoExtractFrames 
 import { processVideoToGif } from '@worker/queue/video/gif-processor';
 import { processImageToJpg, processImageResize } from '@worker/queue/image/processor';
 import { processMediaProbe } from '@worker/queue/media/processor';
+import { startSupabasePoller } from '@worker/poller/supabase-poller';
 
 await checkRedisHealth();
 
@@ -82,3 +83,6 @@ if (env.STORAGE_MODE === 's3') {
   logger.info(`   S3 Prefix: ${env.S3_PATH_PREFIX}`);
   await checkS3Health();
 }
+
+startSupabasePoller();
+logger.info('🗄️  Supabase database poller started');
