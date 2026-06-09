@@ -125,7 +125,7 @@ async function shouldCopyStreams(inputPath: string): Promise<boolean> {
 
 export async function processVideoToMp4(job: Job<VideoToMp4JobData>): Promise<JobResult> {
   const { inputPath, outputPath, crf, preset, smartCopy, maxEdge } = job.data;
-  const edge = maxEdge && maxEdge > 0 ? maxEdge : 1280;
+  const edge = maxEdge && maxEdge > 0 ? maxEdge : 1920;
 
   if (!existsSync(inputPath)) {
     return {

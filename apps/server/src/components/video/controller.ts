@@ -79,8 +79,8 @@ export function registerVideoRoutes(app: OpenAPIHono) {
       // When the query is absent, defaults match the previous deploy
       // (CRF 28, veryfast preset, 1280px long edge).
       const query = c.req.valid('query') as { crf?: number; maxEdge?: number };
-      const crf = query.crf ?? 28;
-      const maxEdge = query.maxEdge ?? 1280;
+      const crf = query.crf ?? 23;
+      const maxEdge = query.maxEdge ?? 1920;
 
       const result = await processMediaJob({
         file,
@@ -212,9 +212,10 @@ export function registerVideoRoutes(app: OpenAPIHono) {
         jobData: ({ inputPath, outputPath }) => ({
           inputPath,
           outputPath,
-          crf: 28,
+          crf: 23,
           preset: 'veryfast',
           smartCopy: false,
+          maxEdge: 1920,
           uploadToS3: true
         })
       });

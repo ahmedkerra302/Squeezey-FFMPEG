@@ -44,7 +44,14 @@ const worker = new Worker<unknown, JobResult>(
   },
   {
     connection,
-    concurrency: env.WORKER_CONCURRENCY
+    concurrency: env.WORKER_CONCURRENCY,
+    // Long video encodes can exceed BullMQ's default 30s lock,
+    // marking jobs stalled and re-queueing them forever (pending).
+    // PROCESSING_TIMEOUT is 600s, so give the lock 700s of headroom.
+    lockDuration: 700_000,
+    lockRenewTime: 300_000,
+    stalledInterval: 30_000,
+    maxStalledCount: 1
   }
 );
 
