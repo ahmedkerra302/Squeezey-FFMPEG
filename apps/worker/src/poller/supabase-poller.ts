@@ -255,12 +255,12 @@ async function pollOnce(): Promise<void> {
     return;
   }
 
-  if (!data) {
+  const job = (Array.isArray(data) ? data[0] : data) as SupabaseJob | undefined;
+  if (!job || !job.id) {
     // No pending jobs — nothing to do this cycle
     return;
   }
 
-  const job = data as SupabaseJob;
   logger.info({ jobId: job.id }, 'Supabase poller: claimed job');
 
   await processJob(job);
