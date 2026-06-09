@@ -21,7 +21,10 @@ const schema = z.object({
   S3_PUBLIC_URL: z.string().optional(),
   S3_PATH_PREFIX: z.string().default('ffmpeg-rest'),
   S3_DEDUP_ENABLED: z.coerce.boolean().default(true),
-  S3_DEDUP_TTL_DAYS: z.coerce.number().default(90)
+  S3_DEDUP_TTL_DAYS: z.coerce.number().default(90),
+
+  SUPABASE_URL: z.string().url().optional(),
+  SUPABASE_SERVICE_ROLE_KEY: z.string().optional()
 });
 
 export const env = schema.parse(process.env);
