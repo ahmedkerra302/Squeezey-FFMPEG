@@ -92,7 +92,8 @@ export async function checkS3Health(): Promise<void> {
   }
 
   if (!env.S3_ENDPOINT || !env.S3_REGION || !env.S3_BUCKET || !env.S3_ACCESS_KEY_ID || !env.S3_SECRET_ACCESS_KEY) {
-    throw new Error('S3 mode enabled but configuration is incomplete');
+    logger.warn('⚠️  S3 mode enabled but configuration is incomplete; skipping health check');
+    return;
   }
 
   const s3Client = new S3Client({
@@ -108,10 +109,18 @@ export async function checkS3Health(): Promise<void> {
   try {
     await s3Client.send(new HeadBucketCommand({ Bucket: env.S3_BUCKET }));
     logger.info('✅ S3 health check passed');
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-    logger.error(`❌ S3 health check failed: ${errorMessage}`);
-    throw new Error(`S3 health check failed: ${errorMessage}`);
+  } catch (error: any) {
+    const details = {
+      name: error?.name,
+      message: error?.message,
+      code: error?.Code ?? error?.code,
+      httpStatus: error?.$metadata?.httpStatusCode,
+      requestId: error?.$metadata?.requestId,
+      endpoint: env.S3_ENDPOINT,
+      bucket: env.S3_BUCKET,
+      region: env.S3_REGION
+    };
+    logger.warn(details, '⚠️  S3 health check failed (continuing startup; uploads may fail until fixed)');
   }
 }
 
