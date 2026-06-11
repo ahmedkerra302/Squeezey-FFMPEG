@@ -19,6 +19,7 @@ interface JobOptions {
   crf?: number;
   maxEdge?: number;
   outputFormat?: string;
+  quality?: 'off' | 'high' | 'balanced' | 'smallest';
 }
 
 interface SupabaseJob {
@@ -95,7 +96,14 @@ function formatFfmpegError(result: FfmpegRunResult): string {
 }
 
 // Probe input file for video + audio codec names via ffprobe.
-type ProbeResult = { videoCodec: string | null; audioCodec: string | null };
+type ProbeResult = {
+  videoCodec: string | null;
+  audioCodec: string | null;
+  pixFmt: string | null;
+  colorPrimaries: string | null;
+  colorTransfer: string | null;
+  colorSpace: string | null;
+};
 
 function probeCodecs(inputPath: string): Promise<ProbeResult> {
   return new Promise((resolve) => {
@@ -111,9 +119,18 @@ function probeCodecs(inputPath: string): Promise<ProbeResult> {
     v.stdout?.on('data', (c: Buffer) => chunks.push(c));
     v.on('close', () => {
       let videoCodec: string | null = null;
+      let pixFmt: string | null = null;
+      let colorPrimaries: string | null = null;
+      let colorTransfer: string | null = null;
+      let colorSpace: string | null = null;
       try {
         const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
-        videoCodec = parsed?.streams?.[0]?.codec_name ?? null;
+        const vs = parsed?.streams?.[0];
+        videoCodec = vs?.codec_name ?? null;
+        pixFmt = vs?.pix_fmt ?? null;
+        colorPrimaries = vs?.color_primaries ?? null;
+        colorTransfer = vs?.color_transfer ?? null;
+        colorSpace = vs?.color_space ?? null;
       } catch { /* ignore */ }
 
       const args2 = [
@@ -132,11 +149,11 @@ function probeCodecs(inputPath: string): Promise<ProbeResult> {
           const parsed = JSON.parse(Buffer.concat(aChunks).toString('utf8'));
           audioCodec = parsed?.streams?.[0]?.codec_name ?? null;
         } catch { /* ignore */ }
-        resolve({ videoCodec, audioCodec });
+        resolve({ videoCodec, audioCodec, pixFmt, colorPrimaries, colorTransfer, colorSpace });
       });
-      a.on('error', () => resolve({ videoCodec, audioCodec: null }));
+      a.on('error', () => resolve({ videoCodec, audioCodec: null, pixFmt, colorPrimaries, colorTransfer, colorSpace }));
     });
-    v.on('error', () => resolve({ videoCodec: null, audioCodec: null }));
+    v.on('error', () => resolve({ videoCodec: null, audioCodec: null, pixFmt: null, colorPrimaries: null, colorTransfer: null, colorSpace: null }));
   });
 }
 
@@ -219,11 +236,36 @@ function resolveFormat(name?: string): OutputFormatConfig {
   return FORMAT_MAP[(name || 'mp4').toLowerCase()] || FORMAT_MAP.mp4;
 }
 
+// Per-encoder quality tier table. Mirrors FreeConvert-style defaults.
+// libx264/libx265/libvpx-vp9 use CRF; mpeg4 uses -q:v (1..31, lower=better).
+type Quality = 'off' | 'high' | 'balanced' | 'smallest';
+const QUALITY_TABLE: Record<string, Record<Quality, number>> = {
+  libx264:     { off: 18, high: 20, balanced: 23, smallest: 28 },
+  libx265:     { off: 22, high: 24, balanced: 28, smallest: 32 },
+  'libvpx-vp9':{ off: 30, high: 32, balanced: 35, smallest: 38 },
+  mpeg4:       { off:  2, high:  3, balanced:  5, smallest:  8 }
+};
+
+function qualityFromOptions(opts: { quality?: string; crf?: number }): Quality {
+  const q = (opts.quality ?? '').toLowerCase();
+  if (q === 'off' || q === 'high' || q === 'balanced' || q === 'smallest') return q as Quality;
+  // Legacy fallback: derive from crf number.
+  const c = Number(opts.crf ?? 23);
+  if (!c || c === 0) return 'off';
+  if (c <= 22) return 'high';
+  if (c <= 28) return 'balanced';
+  return 'smallest';
+}
+
+function encoderValue(encoder: string, quality: Quality, fallback: number): number {
+  return QUALITY_TABLE[encoder]?.[quality] ?? fallback;
+}
+
 // Build ffmpeg args with codec-aware copy/re-encode decisions.
 function buildVideoEncodeArgs(
   inputPath: string,
   outputPath: string,
-  requestedCrf: number,
+  quality: Quality,
   maxEdge: number,
   format: OutputFormatConfig,
   probe: ProbeResult
@@ -242,35 +284,27 @@ function buildVideoEncodeArgs(
   const videoCompatible = probe.videoCodec ? format.videoCopyOk.has(probe.videoCodec) : false;
   const audioCompatible = !probe.audioCodec || format.audioCopyOk.has(probe.audioCodec);
 
-  // "Off" / crf === 0 => try to remux without re-encoding.
-  // Only safe when BOTH input streams are compatible with the target container.
-  if (requestedCrf === 0) {
-    if (videoCompatible && audioCompatible) {
-      return {
-        mode: 'copy',
-        args: [...baseArgs, '-c', 'copy', ...format.extra, '-y', outputPath]
-      };
-    }
-    // Forced re-encode because the container can't carry the input codecs.
-    // Use the format's sane default CRF — never lossless.
-    const crf = format.defaultCrf;
+  // "Off" => try true remux. Only safe when both streams are container-compatible.
+  if (quality === 'off' && videoCompatible && audioCompatible) {
     return {
-      mode: 'reencode-default',
-      args: buildReencodeArgs(baseArgs, outputPath, crf, maxEdge, format, probe, videoCompatible, audioCompatible)
+      mode: 'copy',
+      args: [...baseArgs, '-c', 'copy', ...format.extra, '-y', outputPath]
     };
   }
 
-  // Normal compress path with user-chosen CRF.
+  // Forced re-encode. "Off" still maps to a visually-lossless tier per codec
+  // (mirrors FreeConvert behavior: silent re-encode at high quality).
+  const mode = quality === 'off' ? 'reencode-default' : 'reencode';
   return {
-    mode: 'reencode',
-    args: buildReencodeArgs(baseArgs, outputPath, requestedCrf, maxEdge, format, probe, false, false)
+    mode,
+    args: buildReencodeArgs(baseArgs, outputPath, quality, maxEdge, format, probe, videoCompatible, audioCompatible)
   };
 }
 
 function buildReencodeArgs(
   baseArgs: string[],
   outputPath: string,
-  crf: number,
+  quality: Quality,
   maxEdge: number,
   format: OutputFormatConfig,
   probe: ProbeResult,
@@ -279,27 +313,66 @@ function buildReencodeArgs(
 ): string[] {
   const args = [...baseArgs];
 
-  // Video: re-encode unless input codec is container-compatible and caller said so.
   if (videoCompatible) {
     args.push('-c:v', 'copy');
   } else {
-    args.push(
-      '-vf', `scale='if(gte(iw,ih),min(${maxEdge},iw),-2)':'if(gte(iw,ih),-2,min(${maxEdge},ih))'`,
-      '-pix_fmt', 'yuv420p',
-      '-codec:v', format.vcodec
-    );
+    // For "Off" / "High" we keep original resolution (visually lossless intent).
+    const keepOriginal = quality === 'off' || quality === 'high';
+    if (!keepOriginal) {
+      args.push(
+        '-vf',
+        `scale='if(gte(iw,ih),min(${maxEdge},iw),-2)':'if(gte(iw,ih),-2,min(${maxEdge},ih))'`
+      );
+    }
+
+    // 10-bit + HDR passthrough: only codecs that actually support it.
+    const is10bit = (probe.pixFmt ?? '').includes('10');
+    let pixFmt = 'yuv420p';
+    if (is10bit && format.vcodec === 'libvpx-vp9') pixFmt = 'yuv420p10le';
+    else if (is10bit && format.vcodec === 'libx265') pixFmt = 'yuv420p10le';
+    args.push('-pix_fmt', pixFmt);
+
+    args.push('-codec:v', format.vcodec);
+
     if (format.vcodec === 'libx264') {
-      args.push('-preset', 'medium', '-crf', crf.toString());
+      const crf = encoderValue('libx264', quality, format.defaultCrf);
+      args.push('-preset', 'medium', '-crf', String(crf));
+    } else if (format.vcodec === 'libx265') {
+      const crf = encoderValue('libx265', quality, format.defaultCrf);
+      args.push('-preset', 'medium', '-crf', String(crf));
+      if (pixFmt === 'yuv420p10le') args.push('-profile:v', 'main10');
     } else if (format.vcodec === 'libvpx-vp9') {
-      args.push('-crf', crf.toString(), '-b:v', '0', '-deadline', 'good', '-cpu-used', '4');
+      const crf = encoderValue('libvpx-vp9', quality, format.defaultCrf);
+      args.push(
+        '-b:v', '0',
+        '-crf', String(crf),
+        '-row-mt', '1',
+        '-tile-columns', '2',
+        '-deadline', 'good',
+        '-cpu-used', '4'
+      );
+      if (pixFmt === 'yuv420p10le') args.push('-profile:v', '2');
     } else if (format.vcodec === 'mpeg4') {
-      args.push('-q:v', crf.toString());
+      const qv = encoderValue('mpeg4', quality, 5);
+      args.push('-q:v', String(qv));
     } else {
-      args.push('-crf', crf.toString());
+      const crf = encoderValue(format.vcodec, quality, format.defaultCrf);
+      args.push('-crf', String(crf));
+    }
+
+    // HDR color metadata passthrough (only meaningful for codecs that store it).
+    if (
+      (format.vcodec === 'libvpx-vp9' || format.vcodec === 'libx265') &&
+      probe.colorPrimaries && probe.colorTransfer && probe.colorSpace
+    ) {
+      args.push(
+        '-color_primaries', probe.colorPrimaries,
+        '-color_trc', probe.colorTransfer,
+        '-colorspace', probe.colorSpace
+      );
     }
   }
 
-  // Audio: re-encode unless input is container-compatible.
   if (probe.audioCodec && audioCompatible) {
     args.push('-c:a', 'copy');
   } else {
@@ -379,11 +452,11 @@ async function uploadOutputToS3(s3: S3Client, filePath: string, outputKey: strin
 
 async function processJob(job: SupabaseJob): Promise<void> {
   const { id: jobId, input_key: inputKey, options } = job;
-  const crf = options?.crf ?? 23;
+  const quality = qualityFromOptions(options ?? {});
   const maxEdge = options?.maxEdge && options.maxEdge > 0 ? options.maxEdge : 1920;
   const outputFormat = resolveFormat(options?.outputFormat);
 
-  logger.info({ jobId, inputKey, crf, maxEdge, outputFormat: outputFormat.ext }, 'Supabase poller: processing job');
+  logger.info({ jobId, inputKey, quality, maxEdge, outputFormat: outputFormat.ext }, 'Supabase poller: processing job');
 
   const workDir = join(tmpdir(), `squeezey-${jobId}`);
   const inputPath = join(workDir, 'input');
@@ -401,7 +474,7 @@ async function processJob(job: SupabaseJob): Promise<void> {
     const probe = await probeCodecs(inputPath);
     logger.info({ jobId, probe }, 'Supabase poller: probed input codecs');
 
-    const { args, mode } = buildVideoEncodeArgs(inputPath, outputPath, crf, maxEdge, outputFormat, probe);
+    const { args, mode } = buildVideoEncodeArgs(inputPath, outputPath, quality, maxEdge, outputFormat, probe);
     logger.info(
       { jobId, mode, target: outputFormat.ext, vcodec: outputFormat.vcodec, acodec: outputFormat.acodec },
       'Supabase poller: starting FFmpeg encode'
