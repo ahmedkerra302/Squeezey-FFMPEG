@@ -18,6 +18,7 @@ const PROCESSING_TIMEOUT_MS = 600_000;
 interface JobOptions {
   crf?: number;
   maxEdge?: number;
+  outputFormat?: string;
 }
 
 interface SupabaseJob {
@@ -93,6 +94,77 @@ function formatFfmpegError(result: FfmpegRunResult): string {
   return `ffmpeg exited with code ${result.code ?? 'unknown'}${tail ? `. Last output:\n${tail}` : ''}`;
 }
 
+
+type OutputFormatConfig = {
+  ext: string;
+  mime: string;
+  vcodec: string;
+  acodec: string;
+  extra: string[];
+  copySafe?: boolean;
+};
+
+const FORMAT_MAP: Record<string, OutputFormatConfig> = {
+  mp4: { ext: 'mp4', mime: 'video/mp4', vcodec: 'libx264', acodec: 'aac', extra: ['-movflags', '+faststart'], copySafe: true },
+  mov: { ext: 'mov', mime: 'video/quicktime', vcodec: 'libx264', acodec: 'aac', extra: ['-movflags', '+faststart'], copySafe: true },
+  m4v: { ext: 'm4v', mime: 'video/x-m4v', vcodec: 'libx264', acodec: 'aac', extra: ['-movflags', '+faststart'], copySafe: true },
+  mkv: { ext: 'mkv', mime: 'video/x-matroska', vcodec: 'libx264', acodec: 'aac', extra: [], copySafe: true },
+  webm: { ext: 'webm', mime: 'video/webm', vcodec: 'libvpx-vp9', acodec: 'libopus', extra: ['-row-mt', '1'] },
+  avi: { ext: 'avi', mime: 'video/x-msvideo', vcodec: 'mpeg4', acodec: 'libmp3lame', extra: ['-q:v', '5'] },
+  '3gp': { ext: '3gp', mime: 'video/3gpp', vcodec: 'libx264', acodec: 'aac', extra: ['-profile:v', 'baseline', '-level', '3.0'] },
+  ts: { ext: 'ts', mime: 'video/mp2t', vcodec: 'libx264', acodec: 'aac', extra: ['-f', 'mpegts'], copySafe: true }
+};
+
+function resolveFormat(name?: string): OutputFormatConfig {
+  return FORMAT_MAP[(name || 'mp4').toLowerCase()] || FORMAT_MAP.mp4;
+}
+
+function buildVideoEncodeArgs(
+  inputPath: string,
+  outputPath: string,
+  crf: number,
+  maxEdge: number,
+  format: OutputFormatConfig
+): string[] {
+  const baseArgs = [
+    '-loglevel', 'warning',
+    '-threads', '1',
+    '-i', inputPath,
+    '-map', '0:v:0',
+    '-map', '0:a:0?',
+    '-dn',
+    '-sn',
+    '-ignore_unknown'
+  ];
+
+  if (crf === 0 && format.copySafe) {
+    return [...baseArgs, '-c', 'copy', ...format.extra, '-y', outputPath];
+  }
+
+  const args = [
+    ...baseArgs,
+    '-vf', `scale='if(gte(iw,ih),min(${maxEdge},iw),-2)':'if(gte(iw,ih),-2,min(${maxEdge},ih))'`,
+    '-pix_fmt', 'yuv420p',
+    '-codec:v', format.vcodec
+  ];
+
+  if (format.vcodec === 'libx264') {
+    args.push('-preset', 'medium', '-crf', crf.toString());
+  } else if (format.vcodec === 'libvpx-vp9') {
+    args.push('-crf', crf.toString(), '-b:v', '0');
+  }
+
+  args.push(
+    '-codec:a', format.acodec,
+    '-b:a', '128k',
+    '-max_muxing_queue_size', '1024',
+    ...format.extra,
+    '-y', outputPath
+  );
+
+  return args;
+}
+
 // ---------------------------------------------------------------------------
 // S3 helpers
 // ---------------------------------------------------------------------------
@@ -136,7 +208,7 @@ async function downloadFromS3(s3: S3Client, key: string, destPath: string): Prom
   await writeFile(destPath, Buffer.concat(chunks));
 }
 
-async function uploadOutputToS3(s3: S3Client, filePath: string, outputKey: string): Promise<string> {
+async function uploadOutputToS3(s3: S3Client, filePath: string, outputKey: string, contentType: string): Promise<string> {
   const fileBuffer = await readFile(filePath);
 
   await s3.send(
@@ -144,7 +216,7 @@ async function uploadOutputToS3(s3: S3Client, filePath: string, outputKey: strin
       Bucket: env.S3_BUCKET!,
       Key: outputKey,
       Body: fileBuffer,
-      ContentType: 'video/mp4',
+      ContentType: contentType,
       ACL: 'public-read'
     })
   );
@@ -164,13 +236,14 @@ async function processJob(job: SupabaseJob): Promise<void> {
   const { id: jobId, input_key: inputKey, options } = job;
   const crf = options?.crf ?? 23;
   const maxEdge = options?.maxEdge && options.maxEdge > 0 ? options.maxEdge : 1920;
+  const outputFormat = resolveFormat(options?.outputFormat);
 
-  logger.info({ jobId, inputKey, crf, maxEdge }, 'Supabase poller: processing job');
+  logger.info({ jobId, inputKey, crf, maxEdge, outputFormat: outputFormat.ext }, 'Supabase poller: processing job');
 
   const workDir = join(tmpdir(), `squeezey-${jobId}`);
   const inputPath = join(workDir, 'input');
-  const outputPath = join(workDir, 'output.mp4');
-  const outputKey = `ffmpeg-rest/outputs/${jobId}.mp4`;
+  const outputPath = join(workDir, `output.${outputFormat.ext}`);
+  const outputKey = `ffmpeg-rest/outputs/${jobId}.${outputFormat.ext}`;
 
   await mkdir(workDir, { recursive: true });
 
@@ -184,26 +257,7 @@ async function processJob(job: SupabaseJob): Promise<void> {
     // Run FFmpeg
     logger.info({ jobId }, 'Supabase poller: starting FFmpeg encode');
     const result = await runFfmpeg(
-      [
-        '-loglevel', 'warning',
-        '-threads', '1',
-        '-i', inputPath,
-        '-map', '0:v:0',
-        '-map', '0:a:0?',
-        '-dn',
-        '-sn',
-        '-ignore_unknown',
-        '-vf', `scale='if(gte(iw,ih),min(${maxEdge},iw),-2)':'if(gte(iw,ih),-2,min(${maxEdge},ih))'`,
-        '-pix_fmt', 'yuv420p',
-        '-codec:v', 'libx264',
-        '-preset', 'medium',
-        '-crf', crf.toString(),
-        '-codec:a', 'aac',
-        '-b:a', '128k',
-        '-max_muxing_queue_size', '1024',
-        '-movflags', '+faststart',
-        '-y', outputPath
-      ],
+      buildVideoEncodeArgs(inputPath, outputPath, crf, maxEdge, outputFormat),
       PROCESSING_TIMEOUT_MS
     );
 
@@ -213,7 +267,7 @@ async function processJob(job: SupabaseJob): Promise<void> {
 
     // Upload output
     logger.info({ jobId, outputKey }, 'Supabase poller: uploading output to S3');
-    await uploadOutputToS3(s3, outputPath, outputKey);
+    await uploadOutputToS3(s3, outputPath, outputKey, outputFormat.mime);
 
     // Mark done
     await supabase!
