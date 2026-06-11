@@ -28,7 +28,7 @@ interface SupabaseJob {
 }
 
 // ---------------------------------------------------------------------------
-// FFmpeg helpers (mirrors the pattern in queue/video/processor.ts)
+// FFmpeg helpers
 // ---------------------------------------------------------------------------
 
 type FfmpegRunResult = {
@@ -94,38 +94,140 @@ function formatFfmpegError(result: FfmpegRunResult): string {
   return `ffmpeg exited with code ${result.code ?? 'unknown'}${tail ? `. Last output:\n${tail}` : ''}`;
 }
 
+// Probe input file for video + audio codec names via ffprobe.
+type ProbeResult = { videoCodec: string | null; audioCodec: string | null };
+
+function probeCodecs(inputPath: string): Promise<ProbeResult> {
+  return new Promise((resolve) => {
+    const args = [
+      '-v', 'error',
+      '-print_format', 'json',
+      '-show_streams',
+      '-select_streams', 'v:0',
+      inputPath
+    ];
+    const v = spawn('ffprobe', args, { stdio: ['ignore', 'pipe', 'ignore'] });
+    const chunks: Buffer[] = [];
+    v.stdout?.on('data', (c: Buffer) => chunks.push(c));
+    v.on('close', () => {
+      let videoCodec: string | null = null;
+      try {
+        const parsed = JSON.parse(Buffer.concat(chunks).toString('utf8'));
+        videoCodec = parsed?.streams?.[0]?.codec_name ?? null;
+      } catch { /* ignore */ }
+
+      const args2 = [
+        '-v', 'error',
+        '-print_format', 'json',
+        '-show_streams',
+        '-select_streams', 'a:0',
+        inputPath
+      ];
+      const a = spawn('ffprobe', args2, { stdio: ['ignore', 'pipe', 'ignore'] });
+      const aChunks: Buffer[] = [];
+      a.stdout?.on('data', (c: Buffer) => aChunks.push(c));
+      a.on('close', () => {
+        let audioCodec: string | null = null;
+        try {
+          const parsed = JSON.parse(Buffer.concat(aChunks).toString('utf8'));
+          audioCodec = parsed?.streams?.[0]?.codec_name ?? null;
+        } catch { /* ignore */ }
+        resolve({ videoCodec, audioCodec });
+      });
+      a.on('error', () => resolve({ videoCodec, audioCodec: null }));
+    });
+    v.on('error', () => resolve({ videoCodec: null, audioCodec: null }));
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Output format + container-compatibility matrix
+// ---------------------------------------------------------------------------
 
 type OutputFormatConfig = {
   ext: string;
   mime: string;
-  vcodec: string;
-  acodec: string;
+  vcodec: string;          // re-encode target video codec
+  acodec: string;          // re-encode target audio codec
+  defaultCrf: number;      // sane default CRF when "Off" forces a re-encode
   extra: string[];
-  copySafe?: boolean;
+  videoCopyOk: Set<string>; // input video codecs that can be remuxed into this container
+  audioCopyOk: Set<string>; // input audio codecs that can be remuxed into this container
 };
 
 const FORMAT_MAP: Record<string, OutputFormatConfig> = {
-  mp4: { ext: 'mp4', mime: 'video/mp4', vcodec: 'libx264', acodec: 'aac', extra: ['-movflags', '+faststart'], copySafe: true },
-  mov: { ext: 'mov', mime: 'video/quicktime', vcodec: 'libx264', acodec: 'aac', extra: ['-movflags', '+faststart'], copySafe: true },
-  m4v: { ext: 'm4v', mime: 'video/x-m4v', vcodec: 'libx264', acodec: 'aac', extra: ['-movflags', '+faststart'], copySafe: true },
-  mkv: { ext: 'mkv', mime: 'video/x-matroska', vcodec: 'libx264', acodec: 'aac', extra: [], copySafe: true },
-  webm: { ext: 'webm', mime: 'video/webm', vcodec: 'libvpx-vp9', acodec: 'libopus', extra: ['-row-mt', '1'] },
-  avi: { ext: 'avi', mime: 'video/x-msvideo', vcodec: 'mpeg4', acodec: 'libmp3lame', extra: ['-q:v', '5'] },
-  '3gp': { ext: '3gp', mime: 'video/3gpp', vcodec: 'libx264', acodec: 'aac', extra: ['-profile:v', 'baseline', '-level', '3.0'] },
-  ts: { ext: 'ts', mime: 'video/mp2t', vcodec: 'libx264', acodec: 'aac', extra: ['-f', 'mpegts'], copySafe: true }
+  mp4: {
+    ext: 'mp4', mime: 'video/mp4',
+    vcodec: 'libx264', acodec: 'aac', defaultCrf: 23,
+    extra: ['-movflags', '+faststart'],
+    videoCopyOk: new Set(['h264', 'hevc', 'mpeg4', 'av1']),
+    audioCopyOk: new Set(['aac', 'mp3', 'ac3'])
+  },
+  mov: {
+    ext: 'mov', mime: 'video/quicktime',
+    vcodec: 'libx264', acodec: 'aac', defaultCrf: 23,
+    extra: ['-movflags', '+faststart'],
+    videoCopyOk: new Set(['h264', 'hevc', 'mpeg4', 'prores', 'av1']),
+    audioCopyOk: new Set(['aac', 'mp3', 'pcm_s16le', 'pcm_s24le', 'ac3'])
+  },
+  m4v: {
+    ext: 'm4v', mime: 'video/x-m4v',
+    vcodec: 'libx264', acodec: 'aac', defaultCrf: 23,
+    extra: ['-movflags', '+faststart'],
+    videoCopyOk: new Set(['h264', 'hevc']),
+    audioCopyOk: new Set(['aac', 'mp3'])
+  },
+  mkv: {
+    ext: 'mkv', mime: 'video/x-matroska',
+    vcodec: 'libx264', acodec: 'aac', defaultCrf: 23,
+    extra: [],
+    // MKV swallows almost anything
+    videoCopyOk: new Set(['h264', 'hevc', 'mpeg4', 'vp8', 'vp9', 'av1', 'theora', 'mpeg2video']),
+    audioCopyOk: new Set(['aac', 'mp3', 'opus', 'vorbis', 'ac3', 'flac', 'pcm_s16le', 'pcm_s24le'])
+  },
+  webm: {
+    ext: 'webm', mime: 'video/webm',
+    vcodec: 'libvpx-vp9', acodec: 'libopus', defaultCrf: 32,
+    extra: ['-row-mt', '1'],
+    videoCopyOk: new Set(['vp8', 'vp9', 'av1']),
+    audioCopyOk: new Set(['opus', 'vorbis'])
+  },
+  avi: {
+    ext: 'avi', mime: 'video/x-msvideo',
+    vcodec: 'mpeg4', acodec: 'libmp3lame', defaultCrf: 5, // mpeg4 uses -q:v
+    extra: [],
+    videoCopyOk: new Set(['mpeg4', 'h264', 'mjpeg']),
+    audioCopyOk: new Set(['mp3', 'ac3', 'pcm_s16le'])
+  },
+  '3gp': {
+    ext: '3gp', mime: 'video/3gpp',
+    vcodec: 'libx264', acodec: 'aac', defaultCrf: 28,
+    extra: ['-profile:v', 'baseline', '-level', '3.0'],
+    videoCopyOk: new Set(['h264', 'h263', 'mpeg4']),
+    audioCopyOk: new Set(['aac', 'amr_nb'])
+  },
+  ts: {
+    ext: 'ts', mime: 'video/mp2t',
+    vcodec: 'libx264', acodec: 'aac', defaultCrf: 23,
+    extra: ['-f', 'mpegts'],
+    videoCopyOk: new Set(['h264', 'hevc', 'mpeg2video']),
+    audioCopyOk: new Set(['aac', 'mp3', 'ac3'])
+  }
 };
 
 function resolveFormat(name?: string): OutputFormatConfig {
   return FORMAT_MAP[(name || 'mp4').toLowerCase()] || FORMAT_MAP.mp4;
 }
 
+// Build ffmpeg args with codec-aware copy/re-encode decisions.
 function buildVideoEncodeArgs(
   inputPath: string,
   outputPath: string,
-  crf: number,
+  requestedCrf: number,
   maxEdge: number,
-  format: OutputFormatConfig
-): string[] {
+  format: OutputFormatConfig,
+  probe: ProbeResult
+): { args: string[]; mode: 'copy' | 'reencode-default' | 'reencode' } {
   const baseArgs = [
     '-loglevel', 'warning',
     '-threads', '1',
@@ -137,31 +239,74 @@ function buildVideoEncodeArgs(
     '-ignore_unknown'
   ];
 
-  if (crf === 0 && format.copySafe) {
-    return [...baseArgs, '-c', 'copy', ...format.extra, '-y', outputPath];
+  const videoCompatible = probe.videoCodec ? format.videoCopyOk.has(probe.videoCodec) : false;
+  const audioCompatible = !probe.audioCodec || format.audioCopyOk.has(probe.audioCodec);
+
+  // "Off" / crf === 0 => try to remux without re-encoding.
+  // Only safe when BOTH input streams are compatible with the target container.
+  if (requestedCrf === 0) {
+    if (videoCompatible && audioCompatible) {
+      return {
+        mode: 'copy',
+        args: [...baseArgs, '-c', 'copy', ...format.extra, '-y', outputPath]
+      };
+    }
+    // Forced re-encode because the container can't carry the input codecs.
+    // Use the format's sane default CRF — never lossless.
+    const crf = format.defaultCrf;
+    return {
+      mode: 'reencode-default',
+      args: buildReencodeArgs(baseArgs, outputPath, crf, maxEdge, format, probe, videoCompatible, audioCompatible)
+    };
   }
 
-  const args = [
-    ...baseArgs,
-    '-vf', `scale='if(gte(iw,ih),min(${maxEdge},iw),-2)':'if(gte(iw,ih),-2,min(${maxEdge},ih))'`,
-    '-pix_fmt', 'yuv420p',
-    '-codec:v', format.vcodec
-  ];
+  // Normal compress path with user-chosen CRF.
+  return {
+    mode: 'reencode',
+    args: buildReencodeArgs(baseArgs, outputPath, requestedCrf, maxEdge, format, probe, false, false)
+  };
+}
 
-  if (format.vcodec === 'libx264') {
-    args.push('-preset', 'medium', '-crf', crf.toString());
-  } else if (format.vcodec === 'libvpx-vp9') {
-    args.push('-crf', crf.toString(), '-b:v', '0');
+function buildReencodeArgs(
+  baseArgs: string[],
+  outputPath: string,
+  crf: number,
+  maxEdge: number,
+  format: OutputFormatConfig,
+  probe: ProbeResult,
+  videoCompatible: boolean,
+  audioCompatible: boolean
+): string[] {
+  const args = [...baseArgs];
+
+  // Video: re-encode unless input codec is container-compatible and caller said so.
+  if (videoCompatible) {
+    args.push('-c:v', 'copy');
+  } else {
+    args.push(
+      '-vf', `scale='if(gte(iw,ih),min(${maxEdge},iw),-2)':'if(gte(iw,ih),-2,min(${maxEdge},ih))'`,
+      '-pix_fmt', 'yuv420p',
+      '-codec:v', format.vcodec
+    );
+    if (format.vcodec === 'libx264') {
+      args.push('-preset', 'medium', '-crf', crf.toString());
+    } else if (format.vcodec === 'libvpx-vp9') {
+      args.push('-crf', crf.toString(), '-b:v', '0', '-deadline', 'good', '-cpu-used', '4');
+    } else if (format.vcodec === 'mpeg4') {
+      args.push('-q:v', crf.toString());
+    } else {
+      args.push('-crf', crf.toString());
+    }
   }
 
-  args.push(
-    '-codec:a', format.acodec,
-    '-b:a', '128k',
-    '-max_muxing_queue_size', '1024',
-    ...format.extra,
-    '-y', outputPath
-  );
+  // Audio: re-encode unless input is container-compatible.
+  if (probe.audioCodec && audioCompatible) {
+    args.push('-c:a', 'copy');
+  } else {
+    args.push('-codec:a', format.acodec, '-b:a', '128k');
+  }
 
+  args.push('-max_muxing_queue_size', '1024', ...format.extra, '-y', outputPath);
   return args;
 }
 
@@ -250,26 +395,27 @@ async function processJob(job: SupabaseJob): Promise<void> {
   try {
     const s3 = buildS3Client();
 
-    // Download input
     logger.info({ jobId, inputKey }, 'Supabase poller: downloading input from S3');
     await downloadFromS3(s3, inputKey, inputPath);
 
-    // Run FFmpeg
-    logger.info({ jobId }, 'Supabase poller: starting FFmpeg encode');
-    const result = await runFfmpeg(
-      buildVideoEncodeArgs(inputPath, outputPath, crf, maxEdge, outputFormat),
-      PROCESSING_TIMEOUT_MS
+    const probe = await probeCodecs(inputPath);
+    logger.info({ jobId, probe }, 'Supabase poller: probed input codecs');
+
+    const { args, mode } = buildVideoEncodeArgs(inputPath, outputPath, crf, maxEdge, outputFormat, probe);
+    logger.info(
+      { jobId, mode, target: outputFormat.ext, vcodec: outputFormat.vcodec, acodec: outputFormat.acodec },
+      'Supabase poller: starting FFmpeg encode'
     );
+
+    const result = await runFfmpeg(args, PROCESSING_TIMEOUT_MS);
 
     if (result.code !== 0 || result.signal) {
       throw new Error(formatFfmpegError(result));
     }
 
-    // Upload output
     logger.info({ jobId, outputKey }, 'Supabase poller: uploading output to S3');
     await uploadOutputToS3(s3, outputPath, outputKey, outputFormat.mime);
 
-    // Mark done
     await supabase!
       .from('jobs')
       .update({
@@ -311,7 +457,6 @@ async function pollOnce(): Promise<void> {
 
   const job = (Array.isArray(data) ? data[0] : data) as SupabaseJob | undefined;
   if (!job || !job.id) {
-    // No pending jobs — nothing to do this cycle
     return;
   }
 
@@ -322,7 +467,6 @@ async function pollOnce(): Promise<void> {
 
 export function startSupabasePoller(): void {
   if (!supabase) {
-    // Credentials not configured — poller is disabled
     return;
   }
 
@@ -339,6 +483,5 @@ export function startSupabasePoller(): void {
     setTimeout(() => void loop(), POLL_INTERVAL_MS);
   };
 
-  // Kick off without blocking the caller
   setTimeout(() => void loop(), 0);
 }
